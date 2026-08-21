@@ -320,6 +320,12 @@ func (p *TxInpoints) appendInput(hash chainhash.Hash, vout uint32) {
 	p.voutIdxs[pos] = count + 1
 }
 
+// inpointsPreallocLimit bounds how many elements a wire-supplied count may
+// pre-allocate before any of the body it describes has been read. It is a
+// buffer-sizing hint, not a protocol limit: counts above it still deserialize
+// correctly, they just grow incrementally instead of in one allocation.
+const inpointsPreallocLimit = 1024
+
 // deserializeFromReader reads the TxInpoints data from the provided reader and
 // populates the TxInpoints object.
 func (p *TxInpoints) deserializeFromReader(buf io.Reader) error {
@@ -335,17 +341,35 @@ func (p *TxInpoints) deserializeFromReader(buf io.Reader) error {
 		return nil
 	}
 
-	p.ParentTxHashes = make([]chainhash.Hash, parentCount)
+	// Grow into the count rather than allocating it up front. parentCount comes
+	// straight off the wire and nothing here can tell a real one from a corrupt
+	// one, so sizing from it hands an attacker — or a single flipped byte in a
+	// cache file — a 4-billion-element allocation before a byte of the body has
+	// been read. Appending instead means a bogus count costs one small buffer and
+	// then fails on EOF, which is what it should have done all along.
+	//
+	// The cap keeps the common case to a single allocation: real parent counts are
+	// typically 1-3, so anything under the limit behaves exactly as before. Larger
+	// genuine counts grow by doubling, a few extra allocations on a path that is
+	// already reading 32 bytes per parent off a reader.
+	p.ParentTxHashes = make([]chainhash.Hash, 0, min(parentCount, inpointsPreallocLimit))
 
 	for i := uint32(0); i < parentCount; i++ {
-		if _, err := io.ReadFull(buf, p.ParentTxHashes[i][:]); err != nil {
+		var parentTxHash chainhash.Hash
+
+		if _, err := io.ReadFull(buf, parentTxHash[:]); err != nil {
 			return fmt.Errorf("unable to read parent tx hash: %w", err)
 		}
+
+		p.ParentTxHashes = append(p.ParentTxHashes, parentTxHash)
 	}
 
 	// Pre-size voutIdxs assuming 1 vout per parent (the common case); growth
-	// only happens for parents with multiple vouts.
-	p.voutIdxs = make([]uint32, 0, parentCount*2)
+	// only happens for parents with multiple vouts. Bounded like the hashes
+	// above, and widened to uint64 first: parentCount*2 in uint32 wraps for any
+	// count above 2^31, so the old expression could ask for a huge allocation or
+	// silently ask for none at all.
+	p.voutIdxs = make([]uint32, 0, min(uint64(parentCount)*2, inpointsPreallocLimit*2))
 
 	for i := uint32(0); i < parentCount; i++ {
 		if _, err := io.ReadFull(buf, bytesUint32[:]); err != nil {
